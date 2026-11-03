@@ -32,6 +32,14 @@ readonly PSEUDO_FS_TYPES=(tmpfs devtmpfs squashfs overlay efivarfs ramfs
 LOGIN_TOOL_NAME=''
 LOGIN_TOOL_PATH=''
 
+# State shared between the backup helpers (option 5).
+USB_TARGETS=()
+USB_LABELS=()
+SELECTED_DEST=''
+COPY_METHOD=''
+# Set while a backup is being written, so Ctrl+C can report it as incomplete.
+CURRENT_BACKUP_DIR=''
+
 # Temporary files registered here are removed by cleanup() on exit.
 TMP_FILES=()
 
@@ -49,6 +57,14 @@ print_warning() {
 
 print_header() {
     printf '\n=== %s ===\n\n' "$1"
+}
+
+# Prints "  label   value" with the label padded to 22 characters.
+# printf "%-22s" pads by BYTES, so labels with accents (2 bytes in UTF-8)
+# would be misaligned; ${#label} counts characters in a UTF-8 locale.
+print_field() {
+    local label="$1" value="$2"
+    printf '  %s%*s %s\n' "${label}" $((22 - ${#label})) '' "${value}"
 }
 
 # Only clear when stdout is a terminal, so output redirected to a file or a
@@ -493,9 +509,311 @@ option_memory() {
 # Option 5: backup to USB
 # ---------------------------------------------------------------------------
 
+# Fills USB_TARGETS and USB_LABELS with the mount points of removable disks.
+# A disk counts as removable when its transport is USB or the kernel marks it
+# as removable (RM) or hot-pluggable (HOTPLUG): many USB SSDs report RM=0.
+find_usb_mount_points() {
+    local disk type rm hotplug tran part size target
+    USB_TARGETS=()
+    USB_LABELS=()
+    # -d whole disks only, -n no header, -p full paths, -r one space between
+    # fields. TRAN goes last because it is empty for non-USB disks.
+    while read -r disk type rm hotplug tran; do
+        if [[ "${type}" != 'disk' ]]; then
+            continue
+        fi
+        if [[ "${tran}" != 'usb' && "${rm}" != '1' && "${hotplug}" != '1' ]]; then
+            continue
+        fi
+        # The disk itself and its partitions; each can have several mounts.
+        while read -r part size; do
+            while IFS= read -r target; do
+                if [[ -n "${target}" ]]; then
+                    USB_TARGETS+=("${target}")
+                    USB_LABELS+=("${part} (${size}) montado en ${target}")
+                fi
+            done < <(findmnt -n -o TARGET --source "${part}" 2>/dev/null)
+        done < <(lsblk -npr -o NAME,SIZE "${disk}" 2>/dev/null)
+    done < <(lsblk -dnpr -o NAME,TYPE,RM,HOTPLUG,TRAN 2>/dev/null)
+}
+
+# Shows the detected USB mount points and lets the user pick one or type a
+# path manually (needed in WSL/VMs without USB passthrough).
+# Sets SELECTED_DEST; returns 1 when the user cancels or the input is invalid.
+select_destination() {
+    local choice i
+    SELECTED_DEST=''
+
+    printf '\nDispositivos de bloque (lsblk -o NAME,RM,TRAN,SIZE,MOUNTPOINT):\n'
+    lsblk -e 1,7 -o NAME,RM,TRAN,SIZE,MOUNTPOINT 2>/dev/null ||
+        print_warning 'no se pudo ejecutar lsblk.'
+
+    find_usb_mount_points
+    printf '\nDestinos disponibles:\n'
+    if ((${#USB_TARGETS[@]} == 0)); then
+        printf '  (no se detectaron memorias USB montadas)\n'
+    fi
+    for i in "${!USB_LABELS[@]}"; do
+        printf '  %d) %s\n' $((i + 1)) "${USB_LABELS[i]}"
+    done
+    printf '  m) Ingresar una ruta de destino manualmente\n'
+    printf '  c) Cancelar\n'
+    read -r -p 'Seleccione el destino: ' choice || return 1
+
+    if [[ "${choice}" == 'm' || "${choice}" == 'M' ]]; then
+        read -r -p 'Ruta de destino: ' SELECTED_DEST || return 1
+    elif [[ "${choice}" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#USB_TARGETS[@]})); then
+        SELECTED_DEST="${USB_TARGETS[choice - 1]}"
+    elif [[ "${choice}" == 'c' || "${choice}" == 'C' ]]; then
+        printf 'Operación cancelada.\n'
+        return 1
+    else
+        print_error "opción de destino no válida: '${choice}'."
+        return 1
+    fi
+    if [[ -z "${SELECTED_DEST}" ]]; then
+        print_error 'no se ingresó ninguna ruta de destino.'
+        return 1
+    fi
+}
+
+# Prints the absolute physical path of a directory.
+absolute_dir() {
+    (cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+validate_backup_source() {
+    local src="$1"
+    if [[ ! -e "${src}" ]]; then
+        print_error "el directorio de origen '${src}' no existe."
+    elif [[ ! -d "${src}" ]]; then
+        print_error "'${src}' no es un directorio."
+    elif [[ ! -r "${src}" || ! -x "${src}" ]]; then
+        print_error "no tiene permiso de lectura sobre '${src}'."
+    else
+        return 0
+    fi
+    return 1
+}
+
+# Arguments: absolute source, absolute destination.
+validate_backup_destination() {
+    local src="$1" dest="$2" mount_point
+    mount_point="$(findmnt -n -o TARGET -T "${dest}" 2>/dev/null)"
+    if [[ -z "${mount_point}" ]]; then
+        print_error "'${dest}' no pertenece a ningún sistema de archivos montado."
+        return 1
+    fi
+    # access(W_OK) also fails on filesystems mounted read-only (EROFS).
+    if [[ ! -w "${dest}" ]]; then
+        print_error "no tiene permiso de escritura en '${dest}' (o está montado como solo lectura)."
+        return 1
+    fi
+    # Copying a directory into itself would recurse forever. The trailing
+    # "/" avoids treating /home/ana2 as being inside /home/ana.
+    if [[ "${dest}/" == "${src%/}/"* ]]; then
+        print_error 'el destino no puede estar dentro del directorio de origen.'
+        return 1
+    fi
+    if [[ "$(findmnt -n -o TARGET -T "${src}" 2>/dev/null)" == "${mount_point}" ]]; then
+        print_warning 'el destino está en el mismo sistema de archivos que el origen; la copia no protege ante una falla de ese disco.'
+    fi
+    return 0
+}
+
+# Arguments: required bytes, absolute destination.
+check_free_space() {
+    local required="$1" dest="$2" available
+    available="$(df -B1 --output=avail -- "${dest}" 2>/dev/null | tail -n 1 | tr -d ' ')"
+    if [[ ! "${available}" =~ ^[0-9]+$ ]]; then
+        print_error "no se pudo determinar el espacio libre en '${dest}'."
+        return 1
+    fi
+    printf 'Espacio requerido (du -sb): %s bytes (%s)\n' "${required}" "$(human_size "${required}")"
+    printf 'Espacio disponible:         %s bytes (%s)\n' "${available}" "$(human_size "${available}")"
+    if ((required >= available)); then
+        print_error 'espacio insuficiente en el destino.'
+        return 1
+    fi
+}
+
+# FAT filesystems (typical on USB drives) cannot store Unix owners,
+# permissions or symlinks, and keep timestamps with 2-second precision.
+is_fat_filesystem() {
+    case "$1" in
+        vfat | msdos | fat | exfat) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Copies the CONTENTS of src into dst. Prints the method used.
+# Returns 0 on success, 1 on a partial or failed copy.
+# Arguments: source, destination directory, destination filesystem type.
+copy_tree() {
+    local src="$1" dst="$2" fstype="$3" rc
+    local -a rsync_opts=(-a)
+    if is_fat_filesystem "${fstype}"; then
+        # -r recursive, -t keep times; no owner/permission/symlink copies.
+        rsync_opts=(-rt --modify-window=2)
+    fi
+
+    if command -v rsync >/dev/null 2>&1; then
+        COPY_METHOD="rsync ${rsync_opts[*]}"
+        # The trailing "/" on the source copies its contents, not the folder.
+        rsync "${rsync_opts[@]}" -- "${src}/" "${dst}/"
+        rc=$?
+    else
+        COPY_METHOD='cp -a'
+        if is_fat_filesystem "${fstype}"; then
+            COPY_METHOD='cp -r --preserve=timestamps'
+            cp -r --preserve=timestamps -- "${src}/." "${dst}/"
+        else
+            cp -a -- "${src}/." "${dst}/"
+        fi
+        rc=$?
+    fi
+    if ((rc != 0)); then
+        print_warning "la copia terminó con errores (código ${rc}); algunos archivos pueden no haberse copiado."
+        return 1
+    fi
+    return 0
+}
+
+# Writes catalogo.txt: relative path and last modification date/time of every
+# file and directory in the source.
+write_catalog() {
+    local src="$1" catalog="$2"
+    {
+        printf '# Catálogo de la copia de seguridad de: %s\n' "${src}"
+        printf '# Generado: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf '# ruta_relativa\tfecha_hora_modificacion\n'
+        # %P = path relative to the starting point; %T = modification time.
+        find "${src}" -mindepth 1 -printf '%P\t%TY-%Tm-%Td %TH:%TM:%TS\n' 2>/dev/null | LC_ALL=C sort
+    } >"${catalog}"
+}
+
+# Two backups started in the same second would get the same name and be
+# merged; a numeric suffix keeps every backup in its own folder.
+unique_backup_dir() {
+    local candidate="$1" n=1
+    while [[ -e "${candidate}" ]]; do
+        candidate="$1_${n}"
+        n=$((n + 1))
+    done
+    printf '%s\n' "${candidate}"
+}
+
+# Prints "<number of regular files> <sum of their sizes in bytes>".
+# Regular files are compared instead of "du -sb" because directory sizes
+# differ between filesystems (ext4 vs vfat) and between du implementations.
+tree_stats() {
+    local dir="$1" count bytes
+    count="$(find "${dir}" -type f -printf '.' 2>/dev/null | wc -c)"
+    bytes="$(find "${dir}" -type f -printf '%s\n' 2>/dev/null | awk '{ s += $1 } END { printf "%.0f\n", s }')"
+    printf '%s %s\n' "${count}" "${bytes}"
+}
+
 option_backup() {
+    local src dest src_abs dest_abs base backup_dir copy_dir fstype answer
+    local required src_count src_bytes dst_count dst_bytes copy_ok=1 verified=0
+    local start_time end_time result
+
     print_header 'Copia de seguridad a memoria USB'
-    printf 'Opción en construcción.\n'
+    warn_if_not_root 'sin privilegios de root los archivos no legibles por su usuario no se copiarán.'
+
+    read -r -p 'Directorio a respaldar: ' src || return 1
+    validate_backup_source "${src}" || return 1
+    src_abs="$(absolute_dir "${src}")" || return 1
+
+    select_destination || return 1
+    dest="${SELECTED_DEST}"
+    if [[ ! -d "${dest}" ]]; then
+        print_error "el destino '${dest}' no existe o no es un directorio."
+        return 1
+    fi
+    dest_abs="$(absolute_dir "${dest}")" || return 1
+    validate_backup_destination "${src_abs}" "${dest_abs}" || return 1
+    fstype="$(findmnt -n -o FSTYPE -T "${dest_abs}" 2>/dev/null)"
+
+    printf '\nCalculando el tamaño del origen...\n'
+    required="$(du -sb -- "${src_abs}" 2>/dev/null | awk '{ print $1 }')"
+    if [[ ! "${required}" =~ ^[0-9]+$ ]]; then
+        print_error "no se pudo calcular el tamaño de '${src_abs}'."
+        return 1
+    fi
+    check_free_space "${required}" "${dest_abs}" || return 1
+
+    base="$(basename -- "${src_abs}")"
+    if [[ "${src_abs}" == '/' ]]; then
+        base='raiz'
+    fi
+    backup_dir="$(unique_backup_dir "${dest_abs}/backup_${base}_$(date '+%Y%m%d_%H%M%S')")"
+    copy_dir="${backup_dir}/${base}"
+
+    printf '\nOrigen:  %s\nDestino: %s (sistema de archivos: %s)\n' "${src_abs}" "${backup_dir}" "${fstype:-desconocido}"
+    if is_fat_filesystem "${fstype}"; then
+        print_warning 'destino FAT: no se conservan propietarios, permisos ni enlaces simbólicos.'
+    fi
+    read -r -p '¿Iniciar la copia? [s/N]: ' answer || return 1
+    if [[ ! "${answer}" =~ ^[sS]$ ]]; then
+        printf 'Operación cancelada.\n'
+        return 1
+    fi
+
+    if ! mkdir -- "${backup_dir}" || ! mkdir -- "${copy_dir}"; then
+        print_error "no se pudo crear '${copy_dir}'."
+        return 1
+    fi
+    CURRENT_BACKUP_DIR="${backup_dir}"
+    start_time="$(date +%s)"
+
+    printf '\nCopiando archivos...\n'
+    copy_tree "${src_abs}" "${copy_dir}" "${fstype}" || copy_ok=0
+    printf 'Generando catalogo.txt...\n'
+    if ! write_catalog "${src_abs}" "${backup_dir}/catalogo.txt"; then
+        print_warning 'no se pudo escribir catalogo.txt.'
+    fi
+
+    printf 'Verificando la copia...\n'
+    read -r src_count src_bytes < <(tree_stats "${src_abs}")
+    read -r dst_count dst_bytes < <(tree_stats "${copy_dir}")
+    if [[ "${src_count}" == "${dst_count}" && "${src_bytes}" == "${dst_bytes}" ]]; then
+        verified=1
+    fi
+
+    printf 'Sincronizando discos (sync)...\n'
+    sync
+    end_time="$(date +%s)"
+    CURRENT_BACKUP_DIR=''
+
+    if ((verified == 1 && copy_ok == 1)); then
+        result='EXITOSA (cantidad y tamaño total coinciden)'
+    else
+        result='FALLIDA (la copia está incompleta o difiere del origen)'
+    fi
+    print_backup_summary "${src_abs}" "${backup_dir}" "${copy_dir}" \
+        $((end_time - start_time)) "${src_count}" "${dst_count}" \
+        "${src_bytes}" "${dst_bytes}" "${result}"
+}
+
+# Arguments: source, backup folder, copy folder, seconds, source file count,
+# copy file count, source bytes, copy bytes, verification result text.
+print_backup_summary() {
+    local src_abs="$1" backup_dir="$2" copy_dir="$3" seconds="$4"
+    local src_count="$5" dst_count="$6" src_bytes="$7" dst_bytes="$8" result="$9"
+
+    print_header 'Resumen de la copia de seguridad'
+    print_field 'Origen:' "${src_abs}"
+    print_field 'Carpeta de respaldo:' "${backup_dir}"
+    print_field 'Copia de archivos:' "${copy_dir}"
+    print_field 'Catálogo:' "${backup_dir}/catalogo.txt"
+    print_field 'Método:' "${COPY_METHOD}"
+    print_field 'Duración:' "${seconds} s"
+    print_field 'Archivos regulares:' "origen ${src_count} / copia ${dst_count}"
+    print_field 'Bytes en archivos:' "origen ${src_bytes} / copia ${dst_bytes}"
+    print_field 'Verificación:' "${result}"
+    printf '\nEl dispositivo NO fue desmontado. Para retirarlo con seguridad ejecute:\n'
+    printf '  umount "%s"\n' "$(findmnt -n -o TARGET -T "${backup_dir}" 2>/dev/null)"
 }
 
 # ---------------------------------------------------------------------------
@@ -513,6 +831,9 @@ cleanup() {
 # shellcheck disable=SC2329
 on_interrupt() {
     printf '\n\nInterrupción recibida (Ctrl+C). Saliendo...\n'
+    if [[ -n "${CURRENT_BACKUP_DIR}" ]]; then
+        print_warning "la copia de seguridad quedó INCOMPLETA en: ${CURRENT_BACKUP_DIR}"
+    fi
     # Exit status 130 = 128 + SIGINT, the shell convention.
     exit 130
 }
@@ -565,4 +886,8 @@ main() {
     exit 0
 }
 
-main "$@"
+# Run the menu only when executed directly; when the file is sourced (e.g. by
+# the BATS tests) just the functions are loaded.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
