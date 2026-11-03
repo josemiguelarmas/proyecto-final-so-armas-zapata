@@ -347,9 +347,78 @@ option_filesystems() {
 # Option 3: ten largest files
 # ---------------------------------------------------------------------------
 
+# Turns the user's input into an absolute directory to search. A block device
+# is translated to its mount point with findmnt (the first one if the device
+# is mounted in several places).
+resolve_search_path() {
+    local input="$1" mount_point
+    if [[ -b "${input}" ]]; then
+        mount_point="$(findmnt -n -f -o TARGET --source "${input}" 2>/dev/null)"
+        if [[ -z "${mount_point}" ]]; then
+            print_error "el dispositivo '${input}' no está montado; móntelo antes de buscar."
+            return 1
+        fi
+        printf '%s\n' "${mount_point}"
+    elif [[ -d "${input}" ]]; then
+        # pwd -P gives the absolute physical path, so find prints absolute
+        # paths even if the user typed a relative one or a symlink.
+        if ! (cd -P -- "${input}" 2>/dev/null && pwd -P); then
+            print_error "no hay permiso para acceder a '${input}'."
+            return 1
+        fi
+    elif [[ -e "${input}" ]]; then
+        print_error "'${input}' no es un directorio ni un dispositivo de bloques."
+        return 1
+    else
+        print_error "'${input}' no existe."
+        return 1
+    fi
+}
+
 option_largest_files() {
+    local input search_path fs_mount err_file size file rank=0 errors
+
     print_header 'Los diez archivos más grandes'
-    printf 'Opción en construcción.\n'
+    read -r -p 'Ingrese un dispositivo (ej. /dev/sdb1) o punto de montaje (ej. /home): ' input || return 1
+    if [[ -z "${input}" ]]; then
+        print_error 'no se ingresó ninguna ruta.'
+        return 1
+    fi
+    search_path="$(resolve_search_path "${input}")" || return 1
+    fs_mount="$(findmnt -n -o TARGET -T "${search_path}" 2>/dev/null)"
+
+    printf '\nBuscando en: %s\n' "${search_path}"
+    if [[ -n "${fs_mount}" && "${fs_mount}" != "${search_path}" ]]; then
+        printf 'Nota: no es un punto de montaje; pertenece al sistema de archivos montado en %s.\n' "${fs_mount}"
+        printf 'Se busca solo dentro de esta ruta, sin salir de ese sistema de archivos.\n'
+    fi
+    warn_if_not_root 'sin privilegios de root algunos directorios pueden no ser accesibles.'
+    printf 'Esto puede tardar en sistemas de archivos grandes...\n\n'
+
+    err_file="$(make_temp_file)" || return 1
+
+    printf '%3s  %16s  %10s  %s\n' '#' 'BYTES' 'LEGIBLE' 'RUTA'
+    # -xdev: do not descend into other filesystems mounted below the path.
+    # Records are "size<TAB>path" terminated by NUL, so names with spaces or
+    # even newlines survive sort and head (-z) and read -d ''.
+    # sort cannot output anything until find has finished, so err_file is
+    # complete by the time the loop ends.
+    while IFS=$'\t' read -r -d '' size file; do
+        rank=$((rank + 1))
+        # A newline inside a name would break the table; show it as "\n".
+        printf '%3d  %16s  %10s  %s\n' "${rank}" "${size}" "$(human_size "${size}")" "${file//$'\n'/\\n}"
+    done < <(LC_ALL=C find "${search_path}" -xdev -type f -printf '%s\t%p\0' 2>"${err_file}" |
+        sort -z -rn | head -z -n 10)
+
+    if ((rank == 0)); then
+        printf 'No se encontraron archivos regulares en %s.\n' "${search_path}"
+    fi
+
+    errors="$(wc -l <"${err_file}")"
+    if ((errors > 0)); then
+        printf '\n'
+        print_warning "find no pudo leer ${errors} ruta(s) (permisos u otros errores); los resultados pueden estar incompletos."
+    fi
 }
 
 # ---------------------------------------------------------------------------
