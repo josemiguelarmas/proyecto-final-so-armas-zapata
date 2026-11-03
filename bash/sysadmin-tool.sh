@@ -36,6 +36,8 @@ LOGIN_TOOL_PATH=''
 USB_TARGETS=()
 USB_LABELS=()
 SELECTED_DEST=''
+# Path typed by the user, set by read_path.
+INPUT_PATH=''
 COPY_METHOD=''
 # Set while a backup is being written, so Ctrl+C can report it as incomplete.
 CURRENT_BACKUP_DIR=''
@@ -91,19 +93,36 @@ warn_if_not_root() {
     fi
 }
 
-# Creates a temporary file, registers it for cleanup and prints its path.
-make_temp_file() {
-    local tmp
-    tmp="$(mktemp)" || return 1
-    TMP_FILES+=("${tmp}")
-    printf '%s\n' "${tmp}"
+# Reads a path typed by the user into INPUT_PATH. IFS= keeps leading and
+# trailing spaces (valid in file names) and a leading "~" is expanded to
+# $HOME, as the shell would do on the command line.
+read_path() {
+    IFS= read -r -p "$1" INPUT_PATH || return 1
+    # The literal "~" typed by the user is compared on purpose.
+    # shellcheck disable=SC2088
+    if [[ "${INPUT_PATH}" == '~' || "${INPUT_PATH}" == '~/'* ]]; then
+        INPUT_PATH="${HOME}${INPUT_PATH:1}"
+    fi
+}
+
+# Asks a yes/no question; succeeds only when the answer is "s" or "S".
+confirm() {
+    local answer
+    read -r -p "$1" answer || return 1
+    if [[ "${answer}" =~ ^[sS]$ ]]; then
+        return 0
+    fi
+    printf 'Operación cancelada.\n'
+    return 1
 }
 
 # Formats a byte count in human-readable IEC units (KiB, MiB, ...).
 # numfmt (GNU coreutils) is preferred; awk is the portable fallback.
 human_size() {
     local bytes="$1"
-    if command -v numfmt >/dev/null 2>&1; then
+    if ((bytes < 1024)); then
+        printf '%sB\n' "${bytes}"
+    elif command -v numfmt >/dev/null 2>&1; then
         numfmt --to=iec-i --suffix=B --format='%.1f' "${bytes}"
     else
         awk -v b="${bytes}" 'BEGIN {
@@ -355,7 +374,7 @@ option_filesystems() {
     # Complementary view of the physical block devices (loop devices, major
     # number 7, are excluded because they are usually snap/squashfs images).
     printf '\nDiscos físicos (lsblk -b):\n'
-    lsblk -b -d -e 7 -o NAME,TYPE,SIZE,RM,TRAN,MODEL 2>/dev/null ||
+    lsblk -b -d -e 1,7 -o NAME,TYPE,SIZE,RM,TRAN,MODEL 2>/dev/null ||
         print_warning 'no se pudo obtener la información de lsblk.'
 }
 
@@ -395,7 +414,8 @@ option_largest_files() {
     local input search_path fs_mount err_file size file rank=0 errors
 
     print_header 'Los diez archivos más grandes'
-    read -r -p 'Ingrese un dispositivo (ej. /dev/sdb1) o punto de montaje (ej. /home): ' input || return 1
+    read_path 'Ingrese un dispositivo (ej. /dev/sdb1) o punto de montaje (ej. /home): ' || return 1
+    input="${INPUT_PATH}"
     if [[ -z "${input}" ]]; then
         print_error 'no se ingresó ninguna ruta.'
         return 1
@@ -411,7 +431,10 @@ option_largest_files() {
     warn_if_not_root 'sin privilegios de root algunos directorios pueden no ser accesibles.'
     printf 'Esto puede tardar en sistemas de archivos grandes...\n\n'
 
-    err_file="$(make_temp_file)" || return 1
+    # mktemp runs in the current shell (not in $(...) of a helper) so the
+    # file is registered in TMP_FILES and removed by cleanup() on exit.
+    err_file="$(mktemp)" || return 1
+    TMP_FILES+=("${err_file}")
 
     printf '%3s  %16s  %10s  %s\n' '#' 'BYTES' 'LEGIBLE' 'RUTA'
     # -xdev: do not descend into other filesystems mounted below the path.
@@ -561,9 +584,10 @@ select_destination() {
     read -r -p 'Seleccione el destino: ' choice || return 1
 
     if [[ "${choice}" == 'm' || "${choice}" == 'M' ]]; then
-        read -r -p 'Ruta de destino: ' SELECTED_DEST || return 1
-    elif [[ "${choice}" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#USB_TARGETS[@]})); then
-        SELECTED_DEST="${USB_TARGETS[choice - 1]}"
+        read_path 'Ruta de destino: ' || return 1
+        SELECTED_DEST="${INPUT_PATH}"
+    elif [[ "${choice}" =~ ^[0-9]+$ ]] && ((10#${choice} >= 1 && 10#${choice} <= ${#USB_TARGETS[@]})); then
+        SELECTED_DEST="${USB_TARGETS[10#${choice} - 1]}"
     elif [[ "${choice}" == 'c' || "${choice}" == 'C' ]]; then
         printf 'Operación cancelada.\n'
         return 1
@@ -688,7 +712,14 @@ write_catalog() {
         printf '# Generado: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
         printf '# ruta_relativa\tfecha_hora_modificacion\n'
         # %P = path relative to the starting point; %T = modification time.
-        find "${src}" -mindepth 1 -printf '%P\t%TY-%Tm-%Td %TH:%TM:%TS\n' 2>/dev/null | LC_ALL=C sort
+        # Records end in NUL so a name containing a newline stays one record;
+        # after sorting, tr shows such newlines as "?" and turns NUL into the
+        # line terminator.
+        # "|| true": find exits 1 when it meets an unreadable directory even
+        # though the catalog is written; only a failing redirection (e.g. a
+        # full or read-only disk) must count as an error.
+        find "${src}" -mindepth 1 -printf '%P\t%TY-%Tm-%Td %TH:%TM:%TS\0' 2>/dev/null |
+            LC_ALL=C sort -z | tr '\n\0' '?\n' || true
     } >"${catalog}"
 }
 
@@ -713,26 +744,34 @@ tree_stats() {
     printf '%s %s\n' "${count}" "${bytes}"
 }
 
+# Interactive part of option 5: asks for source and destination and runs
+# every validation before anything is written.
 option_backup() {
-    local src dest src_abs dest_abs base backup_dir copy_dir fstype answer
-    local required src_count src_bytes dst_count dst_bytes copy_ok=1 verified=0
-    local start_time end_time result
+    local src_abs dest_abs mount_point fstype required base backup_dir
 
     print_header 'Copia de seguridad a memoria USB'
     warn_if_not_root 'sin privilegios de root los archivos no legibles por su usuario no se copiarán.'
 
-    read -r -p 'Directorio a respaldar: ' src || return 1
-    validate_backup_source "${src}" || return 1
-    src_abs="$(absolute_dir "${src}")" || return 1
+    read_path 'Directorio a respaldar: ' || return 1
+    validate_backup_source "${INPUT_PATH}" || return 1
+    src_abs="$(absolute_dir "${INPUT_PATH}")" || return 1
 
     select_destination || return 1
-    dest="${SELECTED_DEST}"
-    if [[ ! -d "${dest}" ]]; then
-        print_error "el destino '${dest}' no existe o no es un directorio."
+    if [[ ! -d "${SELECTED_DEST}" ]]; then
+        print_error "el destino '${SELECTED_DEST}' no existe o no es un directorio."
         return 1
     fi
-    dest_abs="$(absolute_dir "${dest}")" || return 1
+    dest_abs="$(absolute_dir "${SELECTED_DEST}")" || return 1
     validate_backup_destination "${src_abs}" "${dest_abs}" || return 1
+
+    # findmnt -T always finds at least "/", so a destination on the root
+    # filesystem usually means the USB drive is NOT mounted there (e.g. an
+    # empty /media/usb folder). The user must confirm explicitly.
+    mount_point="$(findmnt -n -o TARGET -T "${dest_abs}" 2>/dev/null)"
+    if [[ "${mount_point}" == '/' ]]; then
+        print_warning "el destino está en el sistema de archivos raíz (/), no en un dispositivo montado aparte."
+        confirm '¿Seguro que desea usar este destino? [s/N]: ' || return 1
+    fi
     fstype="$(findmnt -n -o FSTYPE -T "${dest_abs}" 2>/dev/null)"
 
     printf '\nCalculando el tamaño del origen...\n'
@@ -743,22 +782,25 @@ option_backup() {
     fi
     check_free_space "${required}" "${dest_abs}" || return 1
 
+    # The source can never be "/" here: every destination would be inside it.
     base="$(basename -- "${src_abs}")"
-    if [[ "${src_abs}" == '/' ]]; then
-        base='raiz'
-    fi
     backup_dir="$(unique_backup_dir "${dest_abs}/backup_${base}_$(date '+%Y%m%d_%H%M%S')")"
-    copy_dir="${backup_dir}/${base}"
 
     printf '\nOrigen:  %s\nDestino: %s (sistema de archivos: %s)\n' "${src_abs}" "${backup_dir}" "${fstype:-desconocido}"
     if is_fat_filesystem "${fstype}"; then
         print_warning 'destino FAT: no se conservan propietarios, permisos ni enlaces simbólicos.'
     fi
-    read -r -p '¿Iniciar la copia? [s/N]: ' answer || return 1
-    if [[ ! "${answer}" =~ ^[sS]$ ]]; then
-        printf 'Operación cancelada.\n'
-        return 1
-    fi
+    confirm '¿Iniciar la copia? [s/N]: ' || return 1
+
+    run_backup "${src_abs}" "${backup_dir}" "${backup_dir}/${base}" "${fstype}"
+}
+
+# Copies, writes the catalog, verifies and syncs.
+# Arguments: absolute source, backup folder, copy folder, destination fstype.
+run_backup() {
+    local src_abs="$1" backup_dir="$2" copy_dir="$3" fstype="$4"
+    local src_count src_bytes dst_count dst_bytes copy_ok=1 verified=0
+    local start_time end_time result
 
     if ! mkdir -- "${backup_dir}" || ! mkdir -- "${copy_dir}"; then
         print_error "no se pudo crear '${copy_dir}'."
@@ -829,13 +871,14 @@ cleanup() {
 }
 
 # shellcheck disable=SC2329
+# Argument: exit status, 128 + signal number by shell convention
+# (130 = SIGINT/Ctrl+C, 143 = SIGTERM).
 on_interrupt() {
-    printf '\n\nInterrupción recibida (Ctrl+C). Saliendo...\n'
+    printf '\n\nInterrupción recibida (señal). Saliendo...\n'
     if [[ -n "${CURRENT_BACKUP_DIR}" ]]; then
         print_warning "la copia de seguridad quedó INCOMPLETA en: ${CURRENT_BACKUP_DIR}"
     fi
-    # Exit status 130 = 128 + SIGINT, the shell convention.
-    exit 130
+    exit "$1"
 }
 
 show_menu() {
@@ -855,7 +898,8 @@ main() {
     local choice
 
     trap cleanup EXIT
-    trap on_interrupt INT TERM
+    trap 'on_interrupt 130' INT
+    trap 'on_interrupt 143' TERM
 
     check_dependencies || exit 1
     warn_if_not_root "no se está ejecutando como root; algunas opciones pueden mostrar información incompleta."
