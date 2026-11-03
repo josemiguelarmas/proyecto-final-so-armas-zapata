@@ -297,7 +297,7 @@ max_length() {
 option_filesystems() {
     local choice fs source fstype size avail target i
     local w_src w_type w_target
-    local -a df_args=(-B1 --output=source,fstype,size,avail,target)
+    local -a df_args=(-B1 '--output=source,fstype,size,avail,target')
     local -a sources=() types=() sizes=() avails=() targets=()
 
     print_header 'Sistemas de archivos y discos'
@@ -425,9 +425,68 @@ option_largest_files() {
 # Option 4: RAM and swap
 # ---------------------------------------------------------------------------
 
+# Prints one "label: bytes (human) percent" line of the memory report.
+print_memory_line() {
+    local label="$1" bytes="$2" percent="${3:-}"
+    printf '  %-27s %16s bytes  %10s' "${label}" "${bytes}" "$(human_size "${bytes}")"
+    if [[ -n "${percent}" ]]; then
+        printf '  %6s %%' "${percent}"
+    fi
+    printf '\n'
+}
+
 option_memory() {
+    local mem_total mem_free mem_avail swap_total swap_free swap_used estimated
+
     print_header 'Memoria RAM y swap'
-    printf 'Opción en construcción.\n'
+    if [[ ! -r /proc/meminfo ]]; then
+        print_error 'no se puede leer /proc/meminfo.'
+        return 1
+    fi
+
+    # /proc/meminfo labels values as "kB" but they are KiB, hence * 1024.
+    # printf "%.0f" avoids awk printing large numbers in scientific notation.
+    # MemAvailable exists since Linux 3.14; on older kernels it is estimated
+    # as MemFree + Buffers + Cached (estimated=1).
+    read -r mem_total mem_free mem_avail swap_total swap_free estimated < <(awk '
+        /^MemTotal:/     { total = $2 }
+        /^MemFree:/      { free = $2 }
+        /^MemAvailable:/ { avail = $2; has_avail = 1 }
+        /^Buffers:/      { buffers = $2 }
+        /^Cached:/       { cached = $2 }
+        /^SwapTotal:/    { swap_total = $2 }
+        /^SwapFree:/     { swap_free = $2 }
+        END {
+            if (!has_avail) avail = free + buffers + cached
+            printf "%.0f %.0f %.0f %.0f %.0f %d\n", total * 1024, free * 1024,
+                avail * 1024, swap_total * 1024, swap_free * 1024, !has_avail
+        }' /proc/meminfo)
+
+    if [[ -z "${mem_total}" || "${mem_total}" -eq 0 ]]; then
+        print_error 'no se pudo interpretar /proc/meminfo.'
+        return 1
+    fi
+
+    printf 'Memoria RAM (fuente: /proc/meminfo)\n'
+    print_memory_line 'Total (MemTotal):' "${mem_total}"
+    print_memory_line 'Libre (MemFree):' "${mem_free}" "$(percentage "${mem_free}" "${mem_total}")"
+    print_memory_line 'Disponible (MemAvailable):' "${mem_avail}" "$(percentage "${mem_avail}" "${mem_total}")"
+    if [[ "${estimated}" == '1' ]]; then
+        print_warning 'el kernel no expone MemAvailable; se estimó como MemFree + Buffers + Cached.'
+    fi
+    printf '  (Libre = memoria sin usar; Disponible = memoria utilizable sin recurrir a swap,\n'
+    printf '   incluye cachés que el kernel puede liberar.)\n\n'
+
+    printf 'Swap\n'
+    # Guard against division by zero: systems without swap report 0.
+    if ((swap_total == 0)); then
+        print_memory_line 'Total (SwapTotal):' 0
+        printf '  No hay swap configurada; el uso es 0 bytes y el porcentaje no aplica.\n'
+        return 0
+    fi
+    swap_used=$((swap_total - swap_free))
+    print_memory_line 'Total (SwapTotal):' "${swap_total}"
+    print_memory_line 'Usada (Total - Free):' "${swap_used}" "$(percentage "${swap_used}" "${swap_total}")"
 }
 
 # ---------------------------------------------------------------------------
