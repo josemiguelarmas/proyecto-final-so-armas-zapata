@@ -23,6 +23,11 @@ readonly HUMAN_UID_MIN=1000
 # "nobody" has UID 65534 (>= 1000) but is a system account, not a person.
 readonly NOBODY_UID=65534
 
+# Virtual/in-memory filesystems hidden by default in option 2: they do not
+# correspond to a disk. The first four are the ones named in the requirements.
+readonly PSEUDO_FS_TYPES=(tmpfs devtmpfs squashfs overlay efivarfs ramfs
+    rootfs proc sysfs devpts cgroup cgroup2 autofs)
+
 # Last-login tool detected at runtime (see detect_login_tool).
 LOGIN_TOOL_NAME=''
 LOGIN_TOOL_PATH=''
@@ -278,9 +283,64 @@ option_users() {
 # Option 2: filesystems and disks
 # ---------------------------------------------------------------------------
 
+# Returns the length of the longest argument (used to size table columns).
+max_length() {
+    local item max=0
+    for item in "$@"; do
+        if ((${#item} > max)); then
+            max=${#item}
+        fi
+    done
+    printf '%d\n' "${max}"
+}
+
 option_filesystems() {
+    local choice fs source fstype size avail target i
+    local w_src w_type w_target
+    local -a df_args=(-B1 --output=source,fstype,size,avail,target)
+    local -a sources=() types=() sizes=() avails=() targets=()
+
     print_header 'Sistemas de archivos y discos'
-    printf 'Opción en construcción.\n'
+    read -r -p '¿Incluir pseudo-sistemas de archivos (tmpfs, overlay, ...)? [s/N]: ' choice || return 1
+    if [[ ! "${choice}" =~ ^[sS]$ ]]; then
+        for fs in "${PSEUDO_FS_TYPES[@]}"; do
+            df_args+=(-x "${fs}")
+        done
+    fi
+
+    # "read" assigns everything left on the line to the last variable, so a
+    # mount point containing spaces is kept intact in "target".
+    while read -r source fstype size avail target; do
+        sources+=("${source}")
+        types+=("${fstype}")
+        sizes+=("${size}")
+        avails+=("${avail}")
+        targets+=("${target}")
+    done < <(LC_ALL=C df "${df_args[@]}" 2>/dev/null | tail -n +2)
+
+    if ((${#sources[@]} == 0)); then
+        print_error 'df no devolvió ningún sistema de archivos.'
+        return 1
+    fi
+
+    # Column widths adapt to the data so the table stays aligned.
+    w_src="$(max_length 'DISPOSITIVO' "${sources[@]}")"
+    w_type="$(max_length 'TIPO' "${types[@]}")"
+    w_target="$(max_length 'MONTAJE' "${targets[@]}")"
+
+    printf "%-${w_src}s  %-${w_type}s  %18s  %18s  %s\n" \
+        'DISPOSITIVO' 'TIPO' 'TOTAL (BYTES)' 'DISPONIBLE (BYTES)' 'MONTAJE'
+    printf '%*s\n' $((w_src + w_type + w_target + 44)) '' | tr ' ' '-'
+    for i in "${!sources[@]}"; do
+        printf "%-${w_src}s  %-${w_type}s  %18s  %18s  %s\n" \
+            "${sources[i]}" "${types[i]}" "${sizes[i]}" "${avails[i]}" "${targets[i]}"
+    done
+
+    # Complementary view of the physical block devices (loop devices, major
+    # number 7, are excluded because they are usually snap/squashfs images).
+    printf '\nDiscos físicos (lsblk -b):\n'
+    lsblk -b -d -e 7 -o NAME,TYPE,SIZE,RM,TRAN,MODEL 2>/dev/null ||
+        print_warning 'no se pudo obtener la información de lsblk.'
 }
 
 # ---------------------------------------------------------------------------
