@@ -12,7 +12,8 @@
 set -uo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly REQUIRED_CMDS=(getent df find sort head awk du findmnt lsblk date)
+readonly REQUIRED_CMDS=(getent df find sort head tail tr wc awk du date mktemp basename
+    sync findmnt lsblk)
 
 # On Fedora/RHEL tools such as lastlog2 live in /usr/sbin, which is often not
 # in a regular user's PATH, so these directories are searched as well.
@@ -72,7 +73,8 @@ print_field() {
 # Only clear when stdout is a terminal, so output redirected to a file or a
 # test harness is not filled with escape sequences.
 clear_screen() {
-    if [[ -t 1 ]]; then
+    # clear (ncurses) is optional: minimal containers may not include it.
+    if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
         clear
     fi
 }
@@ -411,7 +413,7 @@ resolve_search_path() {
 }
 
 option_largest_files() {
-    local input search_path fs_mount err_file size file rank=0 errors
+    local input search_path fs_mount err_file record size file rank=0 errors
 
     print_header 'Los diez archivos más grandes'
     read_path 'Ingrese un dispositivo (ej. /dev/sdb1) o punto de montaje (ej. /home): ' || return 1
@@ -442,7 +444,11 @@ option_largest_files() {
     # even newlines survive sort and head (-z) and read -d ''.
     # sort cannot output anything until find has finished, so err_file is
     # complete by the time the loop ends.
-    while IFS=$'\t' read -r -d '' size file; do
+    # The record is split by hand at the FIRST tab: "IFS=$'\t' read size file"
+    # would strip a tab at the end of a file name.
+    while IFS= read -r -d '' record; do
+        size="${record%%$'\t'*}"
+        file="${record#*$'\t'}"
         rank=$((rank + 1))
         # A newline inside a name would break the table; show it as "\n".
         printf '%3d  %16s  %10s  %s\n' "${rank}" "${size}" "$(human_size "${size}")" "${file//$'\n'/\\n}"
