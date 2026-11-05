@@ -14,8 +14,8 @@ administrador de un data center. Implementa las cinco opciones del enunciado:
 5. Copia de seguridad de un directorio a una memoria USB, con un catálogo de
    nombres de archivo y fecha de última modificación.
 
-La versión en PowerShell la desarrolla otro integrante de forma independiente
-(ver [`powershell/README.md`](powershell/README.md)) y no se describe aquí.
+La versión en PowerShell se encuentra en [`powershell/sysadmin-tool.ps1`](powershell/sysadmin-tool.ps1)
+y su documentación detallada está en [`powershell/README.md`](powershell/README.md).
 
 Documentación detallada:
 
@@ -350,7 +350,8 @@ Detalles en [`docs/architecture.md`](docs/architecture.md).
 │   └── sysadmin-tool.sh     # la herramienta (único script)
 ├── docs/                    # documentación técnica (arquitectura + una por opción)
 ├── powershell/
-│   └── README.md            # versión PowerShell (otro integrante, fuera de alcance)
+│   ├── sysadmin-tool.ps1    # herramienta en PowerShell para Windows
+│   └── README.md            # documentación de la versión PowerShell
 ├── tests/                   # suite BATS, run-tests.sh y README de pruebas
 ├── .gitattributes           # *.sh con LF (evita "$'\r': command not found")
 ├── .gitignore

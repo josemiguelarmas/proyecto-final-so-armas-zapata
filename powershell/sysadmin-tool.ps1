@@ -136,7 +136,7 @@ function Confirm-Action {
     if ($null -ne $answer -and $answer -match '^[sS]$') {
         return $true
     }
-    Write-Output 'Operación cancelada.'
+    [Console]::Out.WriteLine('Operación cancelada.')
     return $false
 }
 
@@ -610,12 +610,510 @@ function Invoke-OptionMemory {
 }
 
 # ---------------------------------------------------------------------------
-# Option 5: backup to USB (implemented in next commit)
+# Option 5: backup to USB
 # ---------------------------------------------------------------------------
+
+function Get-UsbLogicalDisks {
+    # Detects removable drives (DriveType = 2) and fixed drives backed by a USB bus
+    # (many external USB SSDs/HDDs report DriveType = 3).
+    $usbDeviceIds = @{}
+    try {
+        $logicalRemovable = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop |
+            Where-Object { $_.DriveType -eq 2 -and $null -ne $_.Size })
+        foreach ($d in $logicalRemovable) {
+            $usbDeviceIds[$d.DeviceID.ToUpperInvariant()] = $d
+        }
+    } catch {
+        # Ignore and continue.
+    }
+
+    try {
+        $usbDisks = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceType -eq 'USB' -or ($_.MediaType -match 'Removable|External') })
+        foreach ($ud in $usbDisks) {
+            $partitions = @(Get-CimAssociatedInstance -InputObject $ud -ResultClassName Win32_DiskPartition -ErrorAction SilentlyContinue)
+            foreach ($part in $partitions) {
+                $ldisks = @(Get-CimAssociatedInstance -InputObject $part -ResultClassName Win32_LogicalDisk -ErrorAction SilentlyContinue)
+                foreach ($ld in $ldisks) {
+                    if ($null -ne $ld.DeviceID -and $null -ne $ld.Size) {
+                        $usbDeviceIds[$ld.DeviceID.ToUpperInvariant()] = $ld
+                    }
+                }
+            }
+        }
+    } catch {
+        # Ignore association errors.
+    }
+
+    return @($usbDeviceIds.Values | Sort-Object -Property DeviceID)
+}
+
+function Select-BackupDestination {
+    [Console]::Out.WriteLine("")
+    [Console]::Out.WriteLine('Unidades de almacenamiento (Win32_LogicalDisk):')
+    try {
+        $allDisks = @(Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop)
+        [Console]::Out.WriteLine(("{0,-8}  {1,-10}  {2,-8}  {3,12}  {4}" -f 'UNIDAD', 'TIPO', 'FS', 'TAMAÑO', 'ETIQUETA'))
+        foreach ($d in $allDisks) {
+            $dType = Get-DriveTypeName -DriveType ([int]$d.DriveType)
+            $dFs = if ([string]::IsNullOrEmpty($d.FileSystem)) { '-' } else { $d.FileSystem }
+            $dSize = if ($null -ne $d.Size) { Format-HumanSize -Bytes ([int64]$d.Size) } else { '0B' }
+            $dLabel = if ([string]::IsNullOrEmpty($d.VolumeName)) { '-' } else { $d.VolumeName }
+            [Console]::Out.WriteLine(("{0,-8}  {1,-10}  {2,-8}  {3,12}  {4}" -f ("{0}\" -f $d.DeviceID), $dType, $dFs, $dSize, $dLabel))
+        }
+    } catch {
+        Write-WarningMsg 'no se pudo listar Win32_LogicalDisk.'
+    }
+
+    $usbList = @(Get-UsbLogicalDisks)
+    [Console]::Out.WriteLine("")
+    [Console]::Out.WriteLine('Destinos disponibles:')
+    if ($usbList.Count -eq 0) {
+        [Console]::Out.WriteLine('  (no se detectaron memorias USB montadas)')
+    } else {
+        for ($i = 0; $i -lt $usbList.Count; $i++) {
+            $u = $usbList[$i]
+            $uSize = Format-HumanSize -Bytes ([int64]$u.Size)
+            $uLabel = if ([string]::IsNullOrEmpty($u.VolumeName)) { 'Sin etiqueta' } else { $u.VolumeName }
+            [Console]::Out.WriteLine(("  {0}) {1}\ ({2}, {3}, {4})" -f ($i + 1), $u.DeviceID, $uLabel, $u.FileSystem, $uSize))
+        }
+    }
+    [Console]::Out.WriteLine('  m) Ingresar una ruta de destino manualmente')
+    [Console]::Out.WriteLine('  c) Cancelar')
+
+    $choice = Read-UserInput -Prompt 'Seleccione el destino'
+    if ($null -eq $choice) {
+        return $null
+    }
+
+    if ($choice -match '^[mM]$') {
+        $manualPath = Read-UserPath -Prompt 'Ruta de destino'
+        if ([string]::IsNullOrWhiteSpace($manualPath)) {
+            Write-ErrorMsg 'no se ingresó ninguna ruta de destino.'
+            return $null
+        }
+        $trimmed = $manualPath.Trim()
+        if ($trimmed -match '^[a-zA-Z]$') {
+            $trimmed = "${trimmed}:\"
+        } elseif ($trimmed -match '^[a-zA-Z]:$') {
+            $trimmed = "${trimmed}\"
+        }
+        return $trimmed
+    } elseif ($choice -match '^[cC]$') {
+        [Console]::Out.WriteLine('Operación cancelada.')
+        return $null
+    } elseif ($choice -match '^\d+$') {
+        $idx = [int]$choice
+        if ($idx -ge 1 -and $idx -le $usbList.Count) {
+            return ("{0}\" -f $usbList[$idx - 1].DeviceID)
+        }
+    }
+
+    Write-ErrorMsg ("opción de destino no válida: '{0}'." -f $choice)
+    return $null
+}
+
+function Resolve-ExistingDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathStr,
+        [Parameter(Mandatory = $true)][string]$Role
+    )
+    if (-not (Test-Path -LiteralPath $PathStr -ErrorAction SilentlyContinue)) {
+        if ($Role -eq 'source') {
+            Write-ErrorMsg ("el directorio de origen '{0}' no existe." -f $PathStr)
+        } else {
+            Write-ErrorMsg ("el destino '{0}' no existe o no es un directorio." -f $PathStr)
+        }
+        return $null
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $PathStr -Force -ErrorAction Stop
+    } catch {
+        Write-ErrorMsg ("no tiene permiso de lectura sobre '{0}'." -f $PathStr)
+        return $null
+    }
+
+    if (-not $item.PSIsContainer) {
+        if ($Role -eq 'source') {
+            Write-ErrorMsg ("'{0}' no es un directorio." -f $PathStr)
+        } else {
+            Write-ErrorMsg ("el destino '{0}' no existe o no es un directorio." -f $PathStr)
+        }
+        return $null
+    }
+
+    try {
+        $null = [System.IO.Directory]::GetFileSystemEntries($item.FullName)
+    } catch {
+        Write-ErrorMsg ("no tiene permiso de lectura sobre '{0}'." -f $PathStr)
+        return $null
+    }
+
+    return $item.FullName
+}
+
+function Test-BackupDestination {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceAbs,
+        [Parameter(Mandatory = $true)][string]$DestAbs
+    )
+    $srcRoot = [System.IO.Path]::GetPathRoot($SourceAbs)
+    $dstRoot = [System.IO.Path]::GetPathRoot($DestAbs)
+    if ([string]::IsNullOrEmpty($dstRoot) -or -not (Test-Path -LiteralPath $dstRoot -ErrorAction SilentlyContinue)) {
+        Write-ErrorMsg ("'{0}' no pertenece a ningún sistema de archivos montado." -f $DestAbs)
+        return $false
+    }
+
+    # Prevent copying a directory into itself (case-insensitive on Windows).
+    # Append trailing backslash so C:\datos2 is not treated as inside C:\datos.
+    $srcWithSep = $SourceAbs.TrimEnd('\') + '\'
+    $dstWithSep = $DestAbs.TrimEnd('\') + '\'
+    if ($dstWithSep.StartsWith($srcWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-ErrorMsg 'el destino no puede estar dentro del directorio de origen.'
+        return $false
+    }
+
+    # Verify write permission on destination by testing drive readiness and ACL/write probe
+    try {
+        $driveInfo = New-Object System.IO.DriveInfo($dstRoot)
+        if (-not $driveInfo.IsReady) {
+            Write-ErrorMsg ("la unidad '{0}' no está lista." -f $dstRoot)
+            return $false
+        }
+        $probeFile = Join-Path -Path $DestAbs -ChildPath (".sysadmin_write_test_{0}.tmp" -f [Guid]::NewGuid().ToString('N'))
+        [System.IO.File]::WriteAllText($probeFile, '')
+        Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-ErrorMsg ("no tiene permiso de escritura en '{0}' (o está montado como solo lectura)." -f $DestAbs)
+        return $false
+    }
+
+    if ($srcRoot.Equals($dstRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-WarningMsg 'el destino está en la misma unidad que el origen; la copia no protege ante una falla de ese disco.'
+    }
+    return $true
+}
+
+function Get-TreeStats {
+    param([Parameter(Mandatory = $true)][string]$DirPath)
+    [int64]$count = 0L
+    [int64]$bytes = 0L
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($DirPath)
+
+    while ($stack.Count -gt 0) {
+        $curr = $stack.Pop()
+        $dInfo = $null
+        try {
+            $dInfo = New-Object System.IO.DirectoryInfo($curr)
+            foreach ($f in $dInfo.EnumerateFiles()) {
+                if (($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    $count++
+                    $bytes += [int64]$f.Length
+                }
+            }
+        } catch {
+            continue
+        }
+        try {
+            foreach ($sub in $dInfo.EnumerateDirectories()) {
+                if (($sub.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    $stack.Push($sub.FullName)
+                }
+            }
+        } catch {
+            # Ignore unreadable subdirectories during stats calculation.
+        }
+    }
+
+    return [PSCustomObject]@{
+        FileCount = $count
+        TotalBytes = $bytes
+    }
+}
+
+function Test-FreeSpace {
+    param(
+        [Parameter(Mandatory = $true)][int64]$RequiredBytes,
+        [Parameter(Mandatory = $true)][string]$DestAbs
+    )
+    try {
+        $dstRoot = [System.IO.Path]::GetPathRoot($DestAbs)
+        $driveInfo = New-Object System.IO.DriveInfo($dstRoot)
+        [int64]$avail = [int64]$driveInfo.AvailableFreeSpace
+    } catch {
+        Write-ErrorMsg ("no se pudo determinar el espacio libre en '{0}'." -f $DestAbs)
+        return $false
+    }
+
+    [Console]::Out.WriteLine(("Espacio requerido:  {0} bytes ({1})" -f $RequiredBytes, (Format-HumanSize -Bytes $RequiredBytes)))
+    [Console]::Out.WriteLine(("Espacio disponible: {0} bytes ({1})" -f $avail, (Format-HumanSize -Bytes $avail)))
+    if ($RequiredBytes -ge $avail) {
+        Write-ErrorMsg 'espacio insuficiente en el destino.'
+        return $false
+    }
+    return $true
+}
+
+function Test-IsFatFilesystem {
+    param([string]$FsType)
+    if ([string]::IsNullOrEmpty($FsType)) {
+        return $false
+    }
+    return ($FsType -match '^(?i)(FAT|FAT16|FAT32|VFAT|EXFAT|MSDOS)$')
+}
+
+function Get-UniqueBackupDir {
+    param([Parameter(Mandatory = $true)][string]$Candidate)
+    $current = $Candidate
+    $n = 1
+    while (Test-Path -LiteralPath $current -ErrorAction SilentlyContinue) {
+        $current = "{0}_{1}" -f $Candidate, $n
+        $n++
+    }
+    return $current
+}
+
+function Copy-BackupTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceAbs,
+        [Parameter(Mandatory = $true)][string]$CopyDir,
+        [string]$FsType
+    )
+    # Use robocopy if available (standard on Windows), preserving data and timestamps
+    # and skipping junction/reparse loops (/XJ). Exit codes 0-7 indicate success/partial copy;
+    # exit code 0 or 1 means all files copied without failure.
+    if (Get-Command -Name 'robocopy' -ErrorAction SilentlyContinue) {
+        $roboOpts = @('/E', '/COPY:DT', '/DCOPY:T', '/XJ', '/R:0', '/W:0', '/NP', '/NFL', '/NDL', '/NJH', '/NJS')
+        if (Test-IsFatFilesystem -FsType $FsType) {
+            $roboOpts += '/FFT'
+        }
+        $script:COPY_METHOD = "robocopy " + ($roboOpts -join ' ')
+        $null = & robocopy $SourceAbs $CopyDir @roboOpts 2>&1
+        $rc = $LASTEXITCODE
+        if ($rc -gt 1) {
+            Write-WarningMsg ("la copia terminó con errores (robocopy código {0}); algunos archivos pueden no haberse copiado." -f $rc)
+            return $false
+        }
+        return $true
+    } else {
+        $script:COPY_METHOD = 'Copy-Item -Recurse -Force'
+        try {
+            Get-ChildItem -LiteralPath $SourceAbs -Force -ErrorAction Stop | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination $CopyDir -Recurse -Force -ErrorAction Stop
+            }
+            return $true
+        } catch {
+            Write-WarningMsg ("la copia terminó con errores ({0}); algunos archivos pueden no haberse copiado." -f $_.Exception.Message)
+            return $false
+        }
+    }
+}
+
+function Write-BackupCatalog {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceAbs,
+        [Parameter(Mandatory = $true)][string]$CatalogPath
+    )
+    $prefixLen = $SourceAbs.TrimEnd('\').Length + 1
+    $entries = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($SourceAbs)
+
+    while ($stack.Count -gt 0) {
+        $curr = $stack.Pop()
+        $dInfo = $null
+        try {
+            $dInfo = New-Object System.IO.DirectoryInfo($curr)
+            foreach ($item in $dInfo.EnumerateFileSystemInfos()) {
+                if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    continue
+                }
+                $relPath = $item.FullName.Substring($prefixLen).Replace('\', '/')
+                $modTime = $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fffffff')
+                $entries.Add(("{0}`t{1}" -f $relPath, $modTime))
+                if ($item -is [System.IO.DirectoryInfo]) {
+                    $stack.Push($item.FullName)
+                }
+            }
+        } catch {
+            continue
+        }
+    }
+
+    $entries.Sort([System.StringComparer]::Ordinal)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(("# Catálogo de la copia de seguridad de: {0}" -f $SourceAbs))
+    $lines.Add(("# Generado: {0}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))
+    $lines.Add("# ruta_relativa`tfecha_hora_modificacion")
+    foreach ($e in $entries) {
+        $lines.Add($e)
+    }
+
+    try {
+        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        [System.IO.File]::WriteAllLines($CatalogPath, $lines, $utf8Bom)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Write-BackupSummary {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceAbs,
+        [Parameter(Mandatory = $true)][string]$BackupDir,
+        [Parameter(Mandatory = $true)][string]$CopyDir,
+        [Parameter(Mandatory = $true)][int64]$DurationSec,
+        [Parameter(Mandatory = $true)][int64]$SrcCount,
+        [Parameter(Mandatory = $true)][int64]$DstCount,
+        [Parameter(Mandatory = $true)][int64]$SrcBytes,
+        [Parameter(Mandatory = $true)][int64]$DstBytes,
+        [Parameter(Mandatory = $true)][string]$ResultText
+    )
+    Write-Header 'Resumen de la copia de seguridad'
+    Write-Field -Label 'Origen:' -Value $SourceAbs
+    Write-Field -Label 'Carpeta de respaldo:' -Value $BackupDir
+    Write-Field -Label 'Copia de archivos:' -Value $CopyDir
+    Write-Field -Label 'Catálogo:' -Value (Join-Path -Path $BackupDir -ChildPath 'catalogo.txt')
+    Write-Field -Label 'Método:' -Value $script:COPY_METHOD
+    Write-Field -Label 'Duración:' -Value ("{0} s" -f $DurationSec)
+    Write-Field -Label 'Archivos regulares:' -Value ("origen {0} / copia {1}" -f $SrcCount, $DstCount)
+    Write-Field -Label 'Bytes en archivos:' -Value ("origen {0} / copia {1}" -f $SrcBytes, $DstBytes)
+    Write-Field -Label 'Verificación:' -Value $ResultText
+    $dstRoot = [System.IO.Path]::GetPathRoot($BackupDir)
+    Write-Output ""
+    Write-Output ("El dispositivo NO fue expulsado. Use 'Quitar hardware de forma segura' antes de retirar {0}." -f $dstRoot)
+}
+
+function Invoke-BackupRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceAbs,
+        [Parameter(Mandatory = $true)][string]$BackupDir,
+        [Parameter(Mandatory = $true)][string]$CopyDir,
+        [string]$FsType
+    )
+    try {
+        $null = New-Item -ItemType Directory -Path $BackupDir -Force -ErrorAction Stop
+        $null = New-Item -ItemType Directory -Path $CopyDir -Force -ErrorAction Stop
+    } catch {
+        Write-ErrorMsg ("no se pudo crear '{0}'." -f $CopyDir)
+        return
+    }
+
+    $startTime = Get-Date
+    Write-Output ""
+    Write-Output 'Copiando archivos...'
+    $copyOk = Copy-BackupTree -SourceAbs $SourceAbs -CopyDir $CopyDir -FsType $FsType
+
+    Write-Output 'Generando catalogo.txt...'
+    $catalogPath = Join-Path -Path $BackupDir -ChildPath 'catalogo.txt'
+    if (-not (Write-BackupCatalog -SourceAbs $SourceAbs -CatalogPath $catalogPath)) {
+        Write-WarningMsg 'no se pudo escribir catalogo.txt.'
+    }
+
+    Write-Output 'Verificando la copia...'
+    $srcStats = Get-TreeStats -DirPath $SourceAbs
+    $dstStats = Get-TreeStats -DirPath $CopyDir
+    $verified = ($srcStats.FileCount -eq $dstStats.FileCount -and $srcStats.TotalBytes -eq $dstStats.TotalBytes)
+
+    Write-Output 'Sincronizando caché de disco...'
+    try {
+        $driveLetter = ([System.IO.Path]::GetPathRoot($BackupDir)).Substring(0, 1)
+        if (Get-Command -Name 'Write-VolumeCache' -ErrorAction SilentlyContinue) {
+            Write-VolumeCache -DriveLetter $driveLetter -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # Ignore if flushing volume cache requires elevation.
+    }
+
+    $duration = [int64][Math]::Max(0, ((Get-Date) - $startTime).TotalSeconds)
+    if ($verified -and $copyOk) {
+        $resultText = 'EXITOSA (cantidad y tamaño total coinciden)'
+    } else {
+        $resultText = 'FALLIDA (la copia está incompleta o difiere del origen)'
+    }
+
+    Write-BackupSummary -SourceAbs $SourceAbs -BackupDir $BackupDir -CopyDir $CopyDir `
+        -DurationSec $duration -SrcCount $srcStats.FileCount -DstCount $dstStats.FileCount `
+        -SrcBytes $srcStats.TotalBytes -DstBytes $dstStats.TotalBytes -ResultText $resultText
+}
 
 function Invoke-OptionBackup {
     Write-Header 'Copia de seguridad a memoria USB'
-    Write-WarningMsg 'Opción 5 pendiente de implementación.'
+    Warn-IfNotAdmin 'sin privilegios de Administrador los archivos no legibles por su usuario no se copiarán.'
+
+    $srcInput = Read-UserPath -Prompt 'Directorio a respaldar'
+    if ([string]::IsNullOrWhiteSpace($srcInput)) {
+        Write-ErrorMsg 'no se ingresó ningún directorio de origen.'
+        return
+    }
+    $srcAbs = Resolve-ExistingDirectory -PathStr $srcInput -Role 'source'
+    if ($null -eq $srcAbs) {
+        return
+    }
+
+    $selectedDest = Select-BackupDestination
+    if ($null -eq $selectedDest) {
+        return
+    }
+    $destAbs = Resolve-ExistingDirectory -PathStr $selectedDest -Role 'dest'
+    if ($null -eq $destAbs) {
+        return
+    }
+
+    if (-not (Test-BackupDestination -SourceAbs $srcAbs -DestAbs $destAbs)) {
+        return
+    }
+
+    $dstRoot = [System.IO.Path]::GetPathRoot($destAbs)
+    $sysDrive = if (-not [string]::IsNullOrEmpty($env:SystemDrive)) { "${env:SystemDrive}\" } else { 'C:\' }
+    if ($dstRoot.Equals($sysDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-WarningMsg ("el destino está en la unidad del sistema ({0}), no en una unidad USB externa." -f $sysDrive)
+        if (-not (Confirm-Action -Prompt '¿Seguro que desea usar este destino? [s/N]')) {
+            return
+        }
+    }
+
+    $fsType = 'desconocido'
+    try {
+        $dInfo = New-Object System.IO.DriveInfo($dstRoot)
+        if (-not [string]::IsNullOrEmpty($dInfo.DriveFormat)) {
+            $fsType = $dInfo.DriveFormat
+        }
+    } catch {
+        # Keep fallback value.
+    }
+
+    Write-Output ""
+    Write-Output 'Calculando el tamaño del origen...'
+    $srcStats = Get-TreeStats -DirPath $srcAbs
+    if (-not (Test-FreeSpace -RequiredBytes $srcStats.TotalBytes -DestAbs $destAbs)) {
+        return
+    }
+
+    $baseName = Split-Path -Path $srcAbs.TrimEnd('\') -Leaf
+    if ([string]::IsNullOrEmpty($baseName)) {
+        $baseName = 'raiz'
+    }
+    $timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+    $backupDir = Get-UniqueBackupDir -Candidate (Join-Path -Path $destAbs -ChildPath ("backup_{0}_{1}" -f $baseName, $timestamp))
+    $copyDir = Join-Path -Path $backupDir -ChildPath $baseName
+
+    Write-Output ""
+    Write-Output ("Origen:  {0}" -f $srcAbs)
+    Write-Output ("Destino: {0} (sistema de archivos: {1})" -f $backupDir, $fsType)
+    if (Test-IsFatFilesystem -FsType $fsType) {
+        Write-WarningMsg 'destino FAT: no se conservan propietarios, permisos ACL ni enlaces simbólicos.'
+    }
+
+    if (-not (Confirm-Action -Prompt '¿Iniciar la copia? [s/N]')) {
+        return
+    }
+
+    Invoke-BackupRun -SourceAbs $srcAbs -BackupDir $backupDir -CopyDir $copyDir -FsType $fsType
 }
 
 # ---------------------------------------------------------------------------
