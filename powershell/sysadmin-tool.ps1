@@ -427,21 +427,186 @@ function Invoke-OptionFilesystems {
 }
 
 # ---------------------------------------------------------------------------
-# Option 3: ten largest files (implemented in next commit)
+# Option 3: ten largest files
 # ---------------------------------------------------------------------------
+
+function Resolve-SearchPath {
+    param([Parameter(Mandatory = $true)][string]$InputPath)
+    $trimmed = $InputPath.Trim()
+    # Normalize bare drive letters ("C" or "C:") to root path ("C:\")
+    if ($trimmed -match '^[a-zA-Z]$') {
+        $trimmed = "${trimmed}:\"
+    } elseif ($trimmed -match '^[a-zA-Z]:$') {
+        $trimmed = "${trimmed}\"
+    }
+
+    if (-not (Test-Path -LiteralPath $trimmed -ErrorAction SilentlyContinue)) {
+        if ($trimmed -match '^[a-zA-Z]:\\$') {
+            Write-ErrorMsg ("la unidad '{0}' no existe o no está montada." -f $trimmed.Substring(0, 2))
+        } else {
+            Write-ErrorMsg ("'{0}' no existe." -f $InputPath)
+        }
+        return $null
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $trimmed -Force -ErrorAction Stop
+    } catch {
+        Write-ErrorMsg ("no hay permiso para acceder a '{0}'." -f $InputPath)
+        return $null
+    }
+
+    if (-not $item.PSIsContainer) {
+        Write-ErrorMsg ("'{0}' no es un directorio ni una unidad de disco." -f $InputPath)
+        return $null
+    }
+
+    # Verify we can actually list the directory root
+    try {
+        $null = [System.IO.Directory]::GetFileSystemEntries($item.FullName)
+    } catch {
+        Write-ErrorMsg ("no hay permiso para acceder a '{0}'." -f $InputPath)
+        return $null
+    }
+
+    return $item.FullName
+}
+
+function Write-MemoryLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][int64]$Bytes,
+        [string]$Percent = ''
+    )
+    $human = Format-HumanSize -Bytes $Bytes
+    if (-not [string]::IsNullOrEmpty($Percent)) {
+        Write-Output ("  {0,-27} {1,16} bytes  {2,10}  {3,6} %" -f $Label, $Bytes, $human, $Percent)
+    } else {
+        Write-Output ("  {0,-27} {1,16} bytes  {2,10}" -f $Label, $Bytes, $human)
+    }
+}
 
 function Invoke-OptionLargestFiles {
     Write-Header 'Los diez archivos más grandes'
-    Write-WarningMsg 'Opción 3 pendiente de implementación.'
+    $inputPath = Read-UserPath -Prompt 'Ingrese una unidad (ej. C:) o directorio (ej. C:\Windows)'
+    if ([string]::IsNullOrWhiteSpace($inputPath)) {
+        Write-ErrorMsg 'no se ingresó ninguna ruta.'
+        return
+    }
+
+    $searchPath = Resolve-SearchPath -InputPath $inputPath
+    if ($null -eq $searchPath) {
+        return
+    }
+
+    $rootPath = [System.IO.Path]::GetPathRoot($searchPath)
+    Write-Output ""
+    Write-Output ("Buscando en: {0}" -f $searchPath)
+    if (-not [string]::IsNullOrEmpty($rootPath) -and ($searchPath.TrimEnd('\') -ne $rootPath.TrimEnd('\'))) {
+        Write-Output ("Nota: no es la raíz de la unidad; pertenece al sistema de archivos montado en {0}." -f $rootPath)
+        Write-Output 'Se busca solo dentro de esta ruta, sin cruzar enlaces simbólicos ni puntos de montaje.'
+    }
+    Warn-IfNotAdmin 'sin privilegios de Administrador algunos directorios pueden no ser accesibles.'
+    Write-Output 'Esto puede tardar en sistemas de archivos grandes...'
+    Write-Output ""
+
+    # Iterative traversal skipping directory reparse points (analogous to find -xdev)
+    # so junctions, symlinks or mounted volumes on other disks are not crossed.
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($searchPath)
+    $files = New-Object System.Collections.Generic.List[object]
+    $errorCount = 0
+
+    while ($stack.Count -gt 0) {
+        $currentDir = $stack.Pop()
+        $dirInfo = $null
+        try {
+            $dirInfo = New-Object System.IO.DirectoryInfo($currentDir)
+            foreach ($f in $dirInfo.EnumerateFiles()) {
+                # Skip reparse point files (symlinks) to match find -type f behavior
+                if (($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    $files.Add([PSCustomObject]@{
+                        Length   = [int64]$f.Length
+                        FullName = [string]$f.FullName
+                    })
+                }
+            }
+        } catch {
+            $errorCount++
+            continue
+        }
+
+        try {
+            foreach ($subDir in $dirInfo.EnumerateDirectories()) {
+                if (($subDir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                    $stack.Push($subDir.FullName)
+                }
+            }
+        } catch {
+            $errorCount++
+        }
+    }
+
+    Write-Output ("{0,3}  {1,16}  {2,10}  {3}" -f '#', 'BYTES', 'LEGIBLE', 'RUTA')
+    if ($files.Count -eq 0) {
+        Write-Output ("No se encontraron archivos regulares en {0}." -f $searchPath)
+    } else {
+        $top10 = @($files | Sort-Object -Property @{Expression = 'Length'; Descending = $true }, @{Expression = 'FullName'; Ascending = $true } | Select-Object -First 10)
+        $rank = 0
+        foreach ($entry in $top10) {
+            $rank++
+            $human = Format-HumanSize -Bytes $entry.Length
+            Write-Output ("{0,3}  {1,16}  {2,10}  {3}" -f $rank, $entry.Length, $human, $entry.FullName)
+        }
+    }
+
+    if ($errorCount -gt 0) {
+        Write-Output ""
+        Write-WarningMsg ("no se pudo leer {0} ruta(s) (permisos u otros errores); los resultados pueden estar incompletos." -f $errorCount)
+    }
 }
 
 # ---------------------------------------------------------------------------
-# Option 4: RAM and swap (implemented in next commit)
+# Option 4: RAM and swap
 # ---------------------------------------------------------------------------
 
 function Invoke-OptionMemory {
     Write-Header 'Memoria RAM y swap'
-    Write-WarningMsg 'Opción 4 pendiente de implementación.'
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    } catch {
+        Write-ErrorMsg ("no se pudo consultar Win32_OperatingSystem: {0}" -f $_.Exception.Message)
+        return
+    }
+
+    if ($null -eq $os.TotalVisibleMemorySize -or $os.TotalVisibleMemorySize -le 0) {
+        Write-ErrorMsg 'no se pudo interpretar la información de memoria de Win32_OperatingSystem.'
+        return
+    }
+
+    # Win32_OperatingSystem reports values in KiB; multiply by 1024 for exact bytes.
+    [int64]$memTotal = [int64]$os.TotalVisibleMemorySize * 1024L
+    [int64]$memFree  = [int64]$os.FreePhysicalMemory * 1024L
+    [int64]$swapTotal = if ($null -ne $os.SizeStoredInPagingFiles) { [int64]$os.SizeStoredInPagingFiles * 1024L } else { 0L }
+    [int64]$swapFree  = if ($null -ne $os.FreeSpaceInPagingFiles) { [int64]$os.FreeSpaceInPagingFiles * 1024L } else { 0L }
+
+    Write-Output 'Memoria RAM (fuente: Win32_OperatingSystem)'
+    Write-MemoryLine -Label 'Total (VisibleMemory):' -Bytes $memTotal
+    Write-MemoryLine -Label 'Libre (FreePhysical):' -Bytes $memFree -Percent (Format-Percentage -Part $memFree -Total $memTotal)
+    Write-Output '  (FreePhysicalMemory representa la memoria RAM física inmediatamente disponible'
+    Write-Output '   sin necesidad de escribir en el archivo de paginación.)'
+    Write-Output ""
+
+    Write-Output 'Swap / Archivo de paginación'
+    if ($swapTotal -le 0) {
+        Write-MemoryLine -Label 'Total (PagingFiles):' -Bytes 0
+        Write-Output '  No hay swap/archivo de paginación configurado; el uso es 0 bytes y el porcentaje no aplica.'
+        return
+    }
+
+    [int64]$swapUsed = [Math]::Max(0L, $swapTotal - $swapFree)
+    Write-MemoryLine -Label 'Total (PagingFiles):' -Bytes $swapTotal
+    Write-MemoryLine -Label 'Usada (Total - Free):' -Bytes $swapUsed -Percent (Format-Percentage -Part $swapUsed -Total $swapTotal)
 }
 
 # ---------------------------------------------------------------------------
