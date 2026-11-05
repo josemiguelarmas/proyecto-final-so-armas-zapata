@@ -19,15 +19,15 @@ y su documentación detallada está en [`powershell/README.md`](powershell/READM
 
 Documentación detallada:
 
-| Documento | Contenido |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Estructura del script, funciones, convenciones, errores, señales, portabilidad |
-| [`docs/option-1-users.md`](docs/option-1-users.md) | Opción 1: usuarios y último login |
-| [`docs/option-2-filesystems.md`](docs/option-2-filesystems.md) | Opción 2: sistemas de archivos y discos |
-| [`docs/option-3-largest-files.md`](docs/option-3-largest-files.md) | Opción 3: diez archivos más grandes |
-| [`docs/option-4-memory.md`](docs/option-4-memory.md) | Opción 4: memoria RAM y swap |
-| [`docs/option-5-backup.md`](docs/option-5-backup.md) | Opción 5: copia de seguridad a USB |
-| [`tests/README.md`](tests/README.md) | Suite de pruebas automatizadas (BATS) |
+| Documento (Bash) | Documento (PowerShell) | Contenido |
+|---|---|---|
+| [`docs/bash/architecture.md`](docs/bash/architecture.md) | [`docs/powershell/architecture.md`](docs/powershell/architecture.md) | Estructura del script, funciones, convenciones, errores |
+| [`docs/bash/option-1-users.md`](docs/bash/option-1-users.md) | [`docs/powershell/option-1-users.md`](docs/powershell/option-1-users.md) | Opción 1: usuarios y último login |
+| [`docs/bash/option-2-filesystems.md`](docs/bash/option-2-filesystems.md) | [`docs/powershell/option-2-filesystems.md`](docs/powershell/option-2-filesystems.md) | Opción 2: sistemas de archivos y discos |
+| [`docs/bash/option-3-largest-files.md`](docs/bash/option-3-largest-files.md) | [`docs/powershell/option-3-largest-files.md`](docs/powershell/option-3-largest-files.md) | Opción 3: diez archivos más grandes |
+| [`docs/bash/option-4-memory.md`](docs/bash/option-4-memory.md) | [`docs/powershell/option-4-memory.md`](docs/powershell/option-4-memory.md) | Opción 4: memoria RAM y swap |
+| [`docs/bash/option-5-backup.md`](docs/bash/option-5-backup.md) | [`docs/powershell/option-5-backup.md`](docs/powershell/option-5-backup.md) | Opción 5: copia de seguridad a USB |
+| [`tests/README.md`](tests/README.md) | [`powershell/README.md`](powershell/README.md) | Suite de pruebas (BATS) y guía general de PowerShell |
 
 Cada documento de opción termina con preguntas probables de la sustentación y
 su respuesta breve.
@@ -312,7 +312,7 @@ errores de la opción 5) en los documentos de cada opción.
 | Mensajes de error por `stderr` con prefijo `ERROR:`/`ADVERTENCIA:` | Separar diagnóstico de resultados; fácil de verificar en pruebas. |
 | `clear` solo si la salida es una terminal (`[[ -t 1 ]]`) | No ensuciar con secuencias de escape la salida redirigida. |
 
-Detalles en [`docs/architecture.md`](docs/architecture.md).
+Detalles en [`docs/bash/architecture.md`](docs/bash/architecture.md).
 
 ## Limitaciones conocidas
 
@@ -348,7 +348,9 @@ Detalles en [`docs/architecture.md`](docs/architecture.md).
 .
 ├── bash/
 │   └── sysadmin-tool.sh     # la herramienta (único script)
-├── docs/                    # documentación técnica (arquitectura + una por opción)
+├── docs/
+│   ├── bash/                # documentación técnica de Bash (arquitectura + opciones 1-5)
+│   └── powershell/          # documentación técnica de PowerShell (arquitectura + opciones 1-5)
 ├── powershell/
 │   ├── sysadmin-tool.ps1    # herramienta en PowerShell para Windows
 │   └── README.md            # documentación de la versión PowerShell

@@ -16,6 +16,17 @@ validaciones y formato que `bash/sysadmin-tool.sh`:
 5. Copia de seguridad de un directorio a una memoria USB, con un catálogo de
    nombres de archivo y fecha de última modificación.
 
+Documentación detallada de PowerShell en `docs/powershell/`:
+
+| Documento | Contenido |
+|---|---|
+| [`../docs/powershell/architecture.md`](../docs/powershell/architecture.md) | Estructura del script, funciones, convenciones y manejo de errores |
+| [`../docs/powershell/option-1-users.md`](../docs/powershell/option-1-users.md) | Opción 1: usuarios y último login |
+| [`../docs/powershell/option-2-filesystems.md`](../docs/powershell/option-2-filesystems.md) | Opción 2: sistemas de archivos y discos |
+| [`../docs/powershell/option-3-largest-files.md`](../docs/powershell/option-3-largest-files.md) | Opción 3: diez archivos más grandes |
+| [`../docs/powershell/option-4-memory.md`](../docs/powershell/option-4-memory.md) | Opción 4: memoria RAM y swap |
+| [`../docs/powershell/option-5-backup.md`](../docs/powershell/option-5-backup.md) | Opción 5: copia de seguridad a USB |
+
 ---
 
 ## Requisitos
