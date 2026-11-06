@@ -26,6 +26,7 @@ Documentación detallada de PowerShell en `docs/powershell/`:
 | [`../docs/powershell/option-3-largest-files.md`](../docs/powershell/option-3-largest-files.md) | Opción 3: diez archivos más grandes |
 | [`../docs/powershell/option-4-memory.md`](../docs/powershell/option-4-memory.md) | Opción 4: memoria RAM y swap |
 | [`../docs/powershell/option-5-backup.md`](../docs/powershell/option-5-backup.md) | Opción 5: copia de seguridad a USB |
+| [`../tests/powershell/README.md`](../tests/powershell/README.md) | Suite de pruebas automatizadas en Pester (`tests/powershell/`) |
 
 ---
 

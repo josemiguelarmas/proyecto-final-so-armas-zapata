@@ -27,7 +27,7 @@ Documentación detallada:
 | [`docs/bash/option-3-largest-files.md`](docs/bash/option-3-largest-files.md) | [`docs/powershell/option-3-largest-files.md`](docs/powershell/option-3-largest-files.md) | Opción 3: diez archivos más grandes |
 | [`docs/bash/option-4-memory.md`](docs/bash/option-4-memory.md) | [`docs/powershell/option-4-memory.md`](docs/powershell/option-4-memory.md) | Opción 4: memoria RAM y swap |
 | [`docs/bash/option-5-backup.md`](docs/bash/option-5-backup.md) | [`docs/powershell/option-5-backup.md`](docs/powershell/option-5-backup.md) | Opción 5: copia de seguridad a USB |
-| [`tests/README.md`](tests/README.md) | [`powershell/README.md`](powershell/README.md) | Suite de pruebas (BATS) y guía general de PowerShell |
+| [`tests/README.md`](tests/README.md) | [`tests/powershell/README.md`](tests/powershell/README.md) | Suites de pruebas automatizadas (BATS para Bash y Pester para PowerShell) |
 
 Cada documento de opción termina con preguntas probables de la sustentación y
 su respuesta breve.

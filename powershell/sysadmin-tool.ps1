@@ -168,7 +168,12 @@ function Format-Percentage {
 }
 
 function Get-MaxLength {
-    param([Parameter(Mandatory = $true)][string[]]$Items)
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [AllowEmptyCollection()]
+        [string[]]$Items
+    )
     $max = 0
     foreach ($item in $Items) {
         if ($null -ne $item -and $item.Length -gt $max) {
